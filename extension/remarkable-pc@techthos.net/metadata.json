@@ -1,0 +1,10 @@
+{
+  "uuid": "remarkable-pc@techthos.net",
+  "name": "reMarkable PC mode",
+  "description": "Uses a USB connected reMarkable 2 as pen tablet and touchpad, with the screen shown on the tablet.",
+  "shell-version": [
+    "50"
+  ],
+  "url": "https://techthos.net",
+  "settings-schema": "org.gnome.shell.extensions.remarkable-pc"
+}

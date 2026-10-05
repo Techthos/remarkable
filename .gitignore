@@ -1,0 +1,6 @@
+backup/
+build/
+__pycache__/
+extension/remarkable-pc@techthos.net/frame
+extension/remarkable-pc@techthos.net/privtmp
+extension/remarkable-pc@techthos.net/evgrab

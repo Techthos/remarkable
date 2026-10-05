@@ -1,0 +1,39 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.remarkable-pc" path="/org/gnome/shell/extensions/remarkable-pc/">
+    <key name="enabled" type="b">
+      <default>true</default>
+    </key>
+    <key name="mirror" type="b">
+      <default>true</default>
+    </key>
+    <key name="show-cursor" type="b">
+      <default>false</default>
+    </key>
+    <key name="image-width" type="i">
+      <default>312</default>
+      <range min="156" max="1860"/>
+    </key>
+    <key name="frame-interval" type="d">
+      <default>0.5</default>
+      <range min="0.1" max="10"/>
+    </key>
+    <key name="change-level" type="i">
+      <default>16</default>
+      <range min="1" max="255"/>
+    </key>
+    <key name="min-changed-pixels" type="i">
+      <default>30</default>
+      <range min="0" max="100000"/>
+    </key>
+    <key name="touchpad" type="b">
+      <default>true</default>
+    </key>
+    <key name="palm-rejection" type="b">
+      <default>true</default>
+    </key>
+    <key name="flipped" type="b">
+      <default>false</default>
+    </key>
+  </schema>
+</schemalist>

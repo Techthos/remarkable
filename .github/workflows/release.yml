@@ -1,0 +1,43 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+env:
+  SDK_VERSION: 3.28.0.172
+  SDK_INSTALLER: remarkable-production-image-5.8.203-rm2-public-x86_64-toolchain.sh
+
+jobs:
+  extension:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+
+      - name: Install gnome-extensions
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends gnome-shell
+
+      - uses: actions/cache@v4
+        with:
+          path: ${{ env.SDK_INSTALLER }}
+          key: ${{ env.SDK_INSTALLER }}
+
+      - name: Install reMarkable SDK
+        run: |
+          [ -f "$SDK_INSTALLER" ] || wget -q "https://storage.googleapis.com/remarkable-codex-toolchain/$SDK_VERSION/$SDK_INSTALLER"
+          sh "$SDK_INSTALLER" -y -d "$RUNNER_TEMP/sdk"
+
+      - name: Build
+        run: make extension SHELL=bash SDK="$RUNNER_TEMP/sdk"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" build/*.shell-extension.zip --generate-notes

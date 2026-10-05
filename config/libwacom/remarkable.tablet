@@ -1,0 +1,15 @@
+[Device]
+Name=reMarkable pen
+ModelName=reMarkable 2
+DeviceMatch=usb|056a|0000|reMarkable pen
+Width=209
+Height=157
+Styli=@generic-with-eraser;
+IntegratedIn=
+
+[Features]
+Stylus=true
+Touch=false
+Reversible=false
+NumRings=0
+NumStrips=0
