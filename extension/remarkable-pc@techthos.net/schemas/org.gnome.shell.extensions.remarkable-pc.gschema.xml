@@ -35,5 +35,23 @@
     <key name="flipped" type="b">
       <default>false</default>
     </key>
+    <key name="layout" type="s">
+      <choices>
+        <choice value="landscape"/>
+        <choice value="below"/>
+        <choice value="minimal"/>
+        <choice value="portrait"/>
+        <choice value="sidebar"/>
+        <choice value="remote"/>
+      </choices>
+      <default>'landscape'</default>
+    </key>
+    <key name="ink" type="b">
+      <default>true</default>
+    </key>
+    <key name="ink-delay" type="d">
+      <default>2.0</default>
+      <range min="0.5" max="30"/>
+    </key>
   </schema>
 </schemalist>

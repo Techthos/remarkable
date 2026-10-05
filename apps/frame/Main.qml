@@ -5,10 +5,12 @@ Window {
     id: root
 
     property int imageNo: 0
+    property int shownImageNo: 0
+    property bool inkShown: false
     property bool restoring: false
     property var quickSettings: ({clock: {time: "", date: ""}, items: [], menu: null})
-    readonly property real aspect: Number(Qt.application.arguments[1]) || 16 / 9
-    readonly property bool flipped: Qt.application.arguments[4] === "1"
+    readonly property var setup: JSON.parse(Qt.application.arguments[1])
+    readonly property string layout: setup.layout
     readonly property int gap: 16
 
     width: Screen.width
@@ -38,6 +40,10 @@ Window {
     ListModel { id: sliders }
     ListModel { id: buttons }
     ListModel { id: menuItems }
+
+    // A new screen image waits while ink is shown, so it is not drawn with the pen waveform.
+    onImageNoChanged: if (!inkShown) shownImageNo = imageNo
+    onInkShownChanged: if (!inkShown) shownImageNo = imageNo
 
     component Tile: Rectangle {
         id: tile
@@ -121,46 +127,68 @@ Window {
         }
     }
 
-    // Landscape canvas: the tablet is held with the thick bezel (portrait left) on top,
-    // or at the bottom when flipped. The bridge sends menu input in these coordinates.
-    Item {
+    // The screen as the tablet is held: landscape with the thick bezel on top, portrait with it on the
+    // left, both turned around when flipped. The bridge places the pad and sends menu input in these
+    // coordinates.
+    Rectangle {
+        id: canvas
         objectName: "canvas"
-        width: parent.height
-        height: parent.width
-        x: flipped ? parent.width : 0
-        y: flipped ? 0 : parent.height
-        rotation: flipped ? 90 : -90
-        transformOrigin: Item.TopLeft
+        anchors.centerIn: parent
+        width: setup.portrait ? parent.width : parent.height
+        height: setup.portrait ? parent.height : parent.width
+        rotation: (setup.portrait ? 0 : -90) + (setup.flipped ? 180 : 0)
 
         Rectangle {
             id: frame
-            anchors.bottom: parent.bottom
-            width: parent.width
-            height: parent.width / aspect
+            x: setup.pad[0]
+            y: setup.pad[1]
+            width: setup.pad[2]
+            height: setup.pad[3]
+            visible: width > 0
             border.width: 6
 
             Image {
                 anchors.fill: parent
                 anchors.margins: parent.border.width
-                source: imageNo ? "image://screen/" + imageNo : ""
+                source: shownImageNo ? "image://screen/" + shownImageNo : ""
                 cache: false
                 smooth: false
             }
         }
 
-        Rectangle {
-            id: strip
-            width: parent.width
-            height: parent.height - frame.height
-            color: "white"
+        // main.cpp draws the ink in here.
+        Item {
+            objectName: "ink"
+            anchors.fill: frame
+        }
 
-            Row {
+        // The menu takes the band above or below the pad. Remote has no pad and draws the menu larger.
+        Item {
+            id: panel
+
+            readonly property real zoom: layout === "remote" ? 1.5 : 1
+
+            y: setup.pad[1] > 0 ? 0 : setup.pad[3]
+            width: canvas.width / zoom
+            height: (canvas.height - setup.pad[3]) / zoom
+            scale: zoom
+            transformOrigin: Item.TopLeft
+
+            Item {
+                id: controls
+
+                // Beside the sliders in a strip, under them in a tall menu, in the column beside the pad,
+                // or none at all, which leaves only Close.
+                readonly property string toggleSpot: ({
+                    landscape: "beside", below: "beside", portrait: "under", remote: "under", sidebar: "side", minimal: "none"
+                })[layout]
+
                 anchors.fill: parent
                 anchors.margins: gap
-                spacing: gap
                 visible: !quickSettings.menu
 
                 Column {
+                    id: clock
                     width: 300
                     spacing: 4
 
@@ -176,6 +204,7 @@ Window {
                     Item { width: 1; height: gap }
                     Row {
                         spacing: 12
+                        visible: controls.toggleSpot !== "none"
 
                         Repeater {
                             model: buttons
@@ -202,8 +231,10 @@ Window {
 
                 Column {
                     id: sliderColumn
-                    width: 520
+                    x: clock.width + gap
+                    width: controls.toggleSpot === "beside" ? 520 : controls.width - x
                     spacing: gap / 2
+                    visible: controls.toggleSpot !== "none"
 
                     Repeater {
                         model: sliders
@@ -219,7 +250,7 @@ Window {
                             }
 
                             width: sliderColumn.width
-                            height: Math.min(80, (strip.height - 2 * gap) / sliders.count - gap / 2)
+                            height: Math.min(80, controls.height / sliders.count - gap / 2)
 
                             Image {
                                 id: sliderIcon
@@ -305,17 +336,29 @@ Window {
                 Grid {
                     id: toggleGrid
 
+                    readonly property real underY: Math.max(clock.height, sliderColumn.height) + gap
+                    readonly property rect area: ({
+                        beside: Qt.rect(sliderColumn.x + sliderColumn.width + gap, 0,
+                                        controls.width - sliderColumn.x - sliderColumn.width - gap, controls.height),
+                        under: Qt.rect(0, underY, controls.width, controls.height - underY),
+                        side: Qt.rect(0, setup.pad[1], setup.pad[0] - 2 * gap, setup.pad[3] - 2 * gap),
+                        none: Qt.rect(controls.width - 300, 0, 300, controls.height),
+                    })[controls.toggleSpot]
                     readonly property int cellHeight: 88
-                    readonly property int availableRows: Math.max(1, Math.floor((strip.height - 2 * gap + spacing) / (cellHeight + spacing)))
-                    readonly property int neededColumns: Math.max(1, Math.ceil((toggles.count + 1) / availableRows))
+                    readonly property int availableRows: Math.max(1, Math.floor((area.height + spacing) / (cellHeight + spacing)))
+                    readonly property int neededColumns: Math.max(1, Math.ceil((toggleTiles.count + 1) / availableRows),
+                                                                  Math.floor((area.width + spacing) / (400 + spacing)))
                     readonly property real cellWidth: (width - (columns - 1) * spacing) / columns
 
-                    width: strip.width - 2 * gap - 300 - 520 - 2 * gap
+                    x: area.x
+                    y: area.y
+                    width: area.width
                     columns: neededColumns
                     spacing: gap / 2
 
                     Repeater {
-                        model: toggles
+                        id: toggleTiles
+                        model: controls.toggleSpot === "none" ? 0 : toggles
 
                         Tile {
                             width: toggleGrid.cellWidth
@@ -340,8 +383,8 @@ Window {
                 }
             }
 
-            // An open submenu replaces the strip; it must stay inside the strip because
-            // input below it belongs to the PC.
+            // An open submenu replaces the menu; it must stay inside it because
+            // input on the pad belongs to the PC.
             Row {
                 anchors.fill: parent
                 anchors.margins: gap
@@ -373,9 +416,9 @@ Window {
                     id: menuGrid
 
                     readonly property int cellHeight: 72
-                    readonly property int availableRows: Math.max(1, Math.floor((strip.height - 2 * gap + spacing) / (cellHeight + spacing)))
+                    readonly property int availableRows: Math.max(1, Math.floor((panel.height - 2 * gap + spacing) / (cellHeight + spacing)))
 
-                    width: strip.width - 2 * gap - 300 - gap
+                    width: panel.width - 2 * gap - 300 - gap
                     columns: Math.max(1, Math.ceil(menuItems.count / availableRows))
                     spacing: gap / 2
 

@@ -6,6 +6,15 @@ import {ExtensionPreferences} from 'resource:///org/gnome/Shell/Extensions/js/ex
 
 const SCREENCAST_TOKEN = GLib.build_filenamev([GLib.get_user_state_dir(), 'rmpc', 'screencast-token']);
 
+const LAYOUTS = {
+    landscape: 'Landscape',
+    below: 'Controls below',
+    minimal: 'Minimal',
+    portrait: 'Portrait',
+    sidebar: 'Sidebar',
+    remote: 'Remote',
+};
+
 export default class RemarkablePcPreferences extends ExtensionPreferences {
     fillPreferencesWindow(window) {
         const settings = this.getSettings();
@@ -28,6 +37,19 @@ export default class RemarkablePcPreferences extends ExtensionPreferences {
 
         const page = new Adw.PreferencesPage();
         window.add(page);
+
+        const layout = new Adw.PreferencesGroup({title: 'Layout'});
+        page.add(layout);
+        const layoutIds = Object.keys(LAYOUTS);
+        const layoutRow = new Adw.ComboRow({
+            title: 'Layout',
+            subtitle: 'How the pad and the menu share the tablet. Remote has no pad.',
+            model: Gtk.StringList.new(Object.values(LAYOUTS)),
+            selected: layoutIds.indexOf(settings.get_string('layout')),
+        });
+        layoutRow.connect('notify::selected', () => settings.set_string('layout', layoutIds[layoutRow.selected]));
+        layout.add(layoutRow);
+        layout.add(switchRow('flipped', 'Flip orientation', 'Thick bezel at the bottom, or on the right in portrait'));
 
         const mirror = new Adw.PreferencesGroup({
             title: 'Screen mirror',
@@ -54,6 +76,7 @@ export default class RemarkablePcPreferences extends ExtensionPreferences {
         page.add(input);
         input.add(switchRow('touchpad', 'Touchpad'));
         input.add(switchRow('palm-rejection', 'Palm rejection', 'Ignore touches while the pen is near'));
-        input.add(switchRow('flipped', 'Flip orientation', 'Thick bezel at the bottom instead of the top'));
+        input.add(switchRow('ink', 'Ink', 'Draw the pen strokes on the tablet'));
+        input.add(spinRow('ink-delay', 'Ink delay', 'Seconds after the pen moves out of range until the ink clears', 0.5, 30, 0.5, 1));
     }
 }

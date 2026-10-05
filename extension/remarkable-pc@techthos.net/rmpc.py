@@ -4,6 +4,7 @@ Stdin and stdout carry JSON lines between the extension and the tablet app."""
 import hashlib
 import json
 import os
+import shlex
 import struct
 import subprocess
 import sys
@@ -20,6 +21,7 @@ PEN_DEVICE, TOUCH_DEVICE = '/dev/input/event1', '/dev/input/event2'
 EVENT_FORMAT = '2IHHi'
 EVENT_SIZE = struct.calcsize(EVENT_FORMAT)
 TABLET_BIN = '/home/root/bin'
+PEN_COPY = '/run/pcmode-pen'
 BUNDLE = ('frame', 'privtmp', 'evgrab')
 
 # Freezes xochitl, shows the frame until this connection or the USB link drops,
@@ -47,18 +49,18 @@ echo 1 > $cgroup/cgroup.freeze
 range=$(awk '/\/dev\/fb0/ {{getline; print $1; exit}}' /proc/$pid/maps)
 start=$((0x${{range%-*}})) end=$((0x${{range#*-}}))
 dd if=/proc/$pid/mem of=/run/pcmode-screen bs=4096 skip=$((start / 4096)) count=$(((end - start) / 4096))
-QT_QPA_PLATFORM=epaper QT_QUICK_BACKEND=epaper {bin}/privtmp {bin}/frame {aspect} {width} {height} {flipped} /run/pcmode-screen >&3 3>&-
+QT_QPA_PLATFORM=epaper QT_QUICK_BACKEND=epaper {bin}/privtmp {bin}/frame {setup} {width} {height} /run/pcmode-screen {pen} >&3 3>&-
 exec 3>&-
-rm /run/pcmode-screen
+rm -f /run/pcmode-screen {pen}
 killall evgrab
 echo 0 > $cgroup/cgroup.freeze
 systemd-notify --pid=$pid WATCHDOG_USEC=60000000
 systemctl unmask --runtime remarkable-fail.service
 """
 
-# The tablet is held in landscape with the thick bezel on top, or at the bottom
-# when flipped, which turns every axis around. The screen frame sits at the bottom,
-# the strip above it holds the menu; pen and touch there go to the tablet app.
+# The canvas is the screen as the tablet is held: landscape with the thick bezel on top,
+# portrait with it on the left, both turned around when flipped. The pad is the part of it
+# that belongs to the PC and shows its screen; pen and touch elsewhere go to the menu.
 DISPLAY_W, DISPLAY_H = 1872, 1404
 PEN_W, PEN_H = 20966, 15725
 TOUCH_W, TOUCH_H, TOUCH_UNITS_PER_MM = 1871, 1403, 9
@@ -69,30 +71,58 @@ PEN_AXES = ((EV_ABS.ABS_X, PEN_W, 100), (EV_ABS.ABS_Y, PEN_H, 100),
 FINGER_TOOLS = (EV_KEY.BTN_TOOL_FINGER, EV_KEY.BTN_TOOL_DOUBLETAP,
                 EV_KEY.BTN_TOOL_TRIPLETAP, EV_KEY.BTN_TOOL_QUADTAP)
 
+# Portrait canvas, pad width as a share of the canvas width, pad docked at the top or bottom right.
+LAYOUTS = {
+    'landscape': (False, 1, 'bottom'),
+    'below': (False, 1, 'top'),
+    'minimal': (False, 1, 'bottom'),
+    'portrait': (True, 1, 'bottom'),
+    'sidebar': (False, 2 / 3, 'bottom'),
+    'remote': (False, 0, 'bottom'),
+}
+
 pen_near = threading.Event()
+
+
+class Canvas:
+    def __init__(self, layout, flipped, aspect):
+        self.portrait, share, dock = LAYOUTS[layout]
+        self.flipped = flipped
+        self.w, self.h = (DISPLAY_H, DISPLAY_W) if self.portrait else (DISPLAY_W, DISPLAY_H)
+        pad_w = round(self.w * share)
+        pad_h = round(pad_w / aspect)
+        self.pad = (self.w - pad_w, 0 if dock == 'top' else self.h - pad_h, pad_w, pad_h)
+
+    def point(self, x, y):
+        """Landscape display pixels with the thick bezel on top to canvas pixels."""
+        if self.portrait:
+            x, y = y, DISPLAY_W - x
+        return (self.w - x, self.h - y) if self.flipped else (x, y)
+
+    def on_pad(self, x, y):
+        pad_x, pad_y, pad_w, pad_h = self.pad
+        return pad_x <= x < pad_x + pad_w and pad_y <= y < pad_y + pad_h
 
 
 class Tablet:
     """Stdin of the tablet app: framed messages, b'I' for a GRAY8 image, b'M' for a JSON message."""
 
     def __init__(self, stdin):
-        self.stdin, self.lock, self.pressed, self.position = stdin, threading.Lock(), False, (0, 0)
+        self.stdin, self.lock, self.pressed = stdin, threading.Lock(), None
 
     def send(self, kind, payload):
         with self.lock:
             self.stdin.write(struct.pack('<cI', kind, len(payload)) + payload)
             self.stdin.flush()
 
-    def point(self, pressed, x=0, y=0):
-        """Press, drag and release in the menu strip, in landscape display pixels.
+    def point(self, position):
+        """Press, drag and release in the menu at a canvas position, None releases.
         A release repeats the last pressed position, so it lands on the pressed button."""
-        if pressed:
-            self.position = (x, y)
-        if pressed or self.pressed:
-            kind = 'move' if pressed and self.pressed else 'press' if pressed else 'release'
-            x, y = self.position
+        if position or self.pressed:
+            kind = 'move' if position and self.pressed else 'press' if position else 'release'
+            x, y = position or self.pressed
             self.send(b'M', json.dumps({'pointer': kind, 'x': x, 'y': y}).encode())
-        self.pressed = pressed
+        self.pressed = position
 
 
 def create_pen():
@@ -106,15 +136,15 @@ def create_pen():
     return device.create_uinput_device()
 
 
-def create_touchpad():
+def create_touchpad(width, height):
     device = libevdev.Device()
     device.name = 'reMarkable touchpad'
     device.enable(INPUT_PROP_POINTER)
     device.enable(INPUT_PROP_BUTTONPAD)
     for key in (EV_KEY.BTN_LEFT, EV_KEY.BTN_TOUCH, *FINGER_TOOLS):
         device.enable(key)
-    for code, maximum in ((EV_ABS.ABS_X, TOUCH_W), (EV_ABS.ABS_Y, TOUCH_H),
-                          (EV_ABS.ABS_MT_POSITION_X, TOUCH_W), (EV_ABS.ABS_MT_POSITION_Y, TOUCH_H)):
+    for code, maximum in ((EV_ABS.ABS_X, width), (EV_ABS.ABS_Y, height),
+                          (EV_ABS.ABS_MT_POSITION_X, width), (EV_ABS.ABS_MT_POSITION_Y, height)):
         device.enable(code, InputAbsInfo(minimum=0, maximum=maximum, resolution=TOUCH_UNITS_PER_MM))
     device.enable(EV_ABS.ABS_MT_SLOT, InputAbsInfo(minimum=0, maximum=31))
     device.enable(EV_ABS.ABS_MT_TRACKING_ID, InputAbsInfo(minimum=0, maximum=65535))
@@ -151,8 +181,8 @@ def install_bundle(client):
             sftp.posix_rename(remote + '.new', remote)
 
 
-def read_events(client, device):
-    channel = client.exec_command(f'{TABLET_BIN}/evgrab {device}')[1].channel
+def read_events(client, *evgrab_args):
+    channel = client.exec_command(' '.join((f'{TABLET_BIN}/evgrab', *evgrab_args)))[1].channel
     pending = b''
     while data := channel.recv(65536):
         pending += data
@@ -162,38 +192,39 @@ def read_events(client, device):
         pending = pending[whole:]
 
 
-def forward_pen(client, pen, tablet, top, flipped):
-    """Above `top` the pen operates the menu strip: the PC sees the pen leave, and gets
-    its whole state back when it returns over the frame."""
+def forward_pen(client, pen, tablet, canvas, ink):
+    """On the pad the pen drives the PC, elsewhere the menu: the PC sees the pen leave, and gets
+    its whole state back when it returns to the pad. With ink, evgrab also copies the pen events to the
+    tablet app, which draws them on the pad without the round trip through the PC."""
+    pad_x, pad_y, pad_w, pad_h = canvas.pad
     pen_codes = {*PEN_KEYS, *(axis[0] for axis in PEN_AXES)}
-    flip = {EV_ABS.ABS_X: PEN_W, EV_ABS.ABS_Y: PEN_H} if flipped else {}
-    frame, state, raw_x, raw_y, in_strip = [], {}, 0, PEN_H, False
-    for code, value in read_events(client, PEN_DEVICE):
+    frame, state, raw, on_pad = [], {}, [0, 0], True
+    for code, value in read_events(client, PEN_DEVICE, *([PEN_COPY] if ink else [])):
         if code in (EV_KEY.BTN_TOOL_PEN, EV_KEY.BTN_TOOL_RUBBER):
             pen_near.set() if value else pen_near.clear()
-        if code in flip:
-            value = flip[code] - value
         if code == EV_ABS.ABS_X:
-            raw_x = value
-        if code == EV_ABS.ABS_Y:
-            raw_y = value
-            value = max(0, round((value - top) * PEN_H / (PEN_H - top)))
-        if code in pen_codes:
+            raw[0] = value * DISPLAY_W / PEN_W
+        elif code == EV_ABS.ABS_Y:
+            raw[1] = value * DISPLAY_H / PEN_H
+        elif code in pen_codes:
             state[code] = value
             frame.append(InputEvent(code, value))
         if code != EV_SYN.SYN_REPORT:
             continue
 
-        was_in_strip, in_strip = in_strip, raw_y < top and pen_near.is_set()
-        if in_strip:
-            if not was_in_strip:
-                pen.send_events([*(InputEvent(key, 0) for key in PEN_KEYS), InputEvent(EV_SYN.SYN_REPORT, 0)])
-            tablet.point(bool(state.get(EV_KEY.BTN_TOUCH)), raw_x * DISPLAY_W / PEN_W, raw_y * DISPLAY_H / PEN_H)
-        else:
-            if was_in_strip:
-                tablet.point(False)
+        x, y = canvas.point(*raw)
+        was_on_pad, on_pad = on_pad, canvas.on_pad(x, y)
+        if on_pad:
+            if not was_on_pad:
+                tablet.point(None)
                 frame = [InputEvent(c, v) for c, v in state.items()]
-            pen.send_events([*frame, InputEvent(EV_SYN.SYN_REPORT, 0)])
+            pen.send_events([*frame, InputEvent(EV_ABS.ABS_X, round((x - pad_x) * PEN_W / pad_w)),
+                             InputEvent(EV_ABS.ABS_Y, round((y - pad_y) * PEN_H / pad_h)),
+                             InputEvent(EV_SYN.SYN_REPORT, 0)])
+        else:
+            if was_on_pad:
+                pen.send_events([*(InputEvent(key, 0) for key in PEN_KEYS), InputEvent(EV_SYN.SYN_REPORT, 0)])
+            tablet.point((round(x), round(y)) if state.get(EV_KEY.BTN_TOUCH) else None)
         frame = []
 
 
@@ -202,61 +233,48 @@ def finger_state(fingers):
             *(InputEvent(tool, int(min(fingers, 4) == count)) for count, tool in enumerate(FINGER_TOOLS, 1))]
 
 
-def forward_touches(client, touchpad, tablet, strip_h, palm_rejection, flipped):
-    """Touch panel portrait axes are swapped into landscape. Touches that begin in the menu strip
-    go to the tablet app until every finger has lifted. With palm rejection, touches are dropped
-    while the pen is near and until every finger has lifted, so a resting palm stays inert."""
-    swapped = {EV_ABS.ABS_MT_POSITION_X: EV_ABS.ABS_MT_POSITION_Y,
-               EV_ABS.ABS_MT_POSITION_Y: EV_ABS.ABS_MT_POSITION_X}
-    flip = {EV_ABS.ABS_MT_POSITION_X: TOUCH_W, EV_ABS.ABS_MT_POSITION_Y: TOUCH_H} if flipped else {}
-    slot, positions, sent_slots, frame, blocked = 0, {}, set(), [], False
-    touching = in_strip = False
+def forward_touches(client, touchpad, tablet, canvas, palm_rejection):
+    """The touch panel's portrait axes run along landscape Y and X. Touches that begin outside the pad
+    go to the menu until every finger has lifted. With palm rejection, touches are dropped while the pen
+    is near and until every finger has lifted, so a resting palm stays inert."""
+    slot, touches, sent, touching, in_menu, blocked = 0, {}, set(), False, False, False
     for code, value in read_events(client, TOUCH_DEVICE):
         if code == EV_ABS.ABS_MT_SLOT:
             slot = value
         elif code == EV_ABS.ABS_MT_TRACKING_ID:
             if value == -1:
-                positions.pop(slot, None)
+                touches.pop(slot, None)
             else:
-                positions[slot] = [0, 0]
-        elif code in swapped:
-            code = swapped[code]
-            if code in flip:
-                value = flip[code] - value
-            positions.setdefault(slot, [0, 0])[code == EV_ABS.ABS_MT_POSITION_Y] = value
-        elif code != EV_SYN.SYN_REPORT:
-            continue
-
+                touches[slot] = [value, 0, 0]
+        elif code == EV_ABS.ABS_MT_POSITION_Y and slot in touches:
+            touches[slot][1] = value * DISPLAY_W / TOUCH_W
+        elif code == EV_ABS.ABS_MT_POSITION_X and slot in touches:
+            touches[slot][2] = value * DISPLAY_H / TOUCH_H
         if code != EV_SYN.SYN_REPORT:
-            frame.append(InputEvent(code, value))
             continue
 
-        if positions and not touching:
-            in_strip = positions[min(positions)][1] * DISPLAY_H / TOUCH_H < strip_h
-        touching = bool(positions)
-        if in_strip:
-            x, y = positions[min(positions)] if touching else (0, 0)
-            tablet.point(touching, x * DISPLAY_W / TOUCH_W, y * DISPLAY_H / TOUCH_H)
-            in_strip, frame = touching, []
+        fingers = {s: (tracking_id, *canvas.point(x, y)) for s, (tracking_id, x, y) in touches.items()}
+        first = fingers[min(fingers)][1:] if fingers else None
+        if first and not touching:
+            in_menu = not canvas.on_pad(*first)
+        touching = bool(fingers)
+        if in_menu:
+            tablet.point((round(first[0]), round(first[1])) if first else None)
+            in_menu = touching
             continue
 
-        blocked = palm_rejection and (pen_near.is_set() or (blocked and bool(positions)))
+        blocked = palm_rejection and (pen_near.is_set() or (blocked and touching))
         if blocked:
-            if sent_slots:
-                releases = [e for s in sent_slots for e in (InputEvent(EV_ABS.ABS_MT_SLOT, s),
-                                                           InputEvent(EV_ABS.ABS_MT_TRACKING_ID, -1))]
-                touchpad.send_events([*releases, InputEvent(EV_ABS.ABS_MT_SLOT, slot),
-                                      *finger_state(0), InputEvent(EV_SYN.SYN_REPORT, 0)])
-                sent_slots.clear()
-            frame = []
-            continue
-
-        sent_slots = set(positions)
-        if positions:
-            x, y = positions[min(positions)]
-            frame += [InputEvent(EV_ABS.ABS_X, x), InputEvent(EV_ABS.ABS_Y, y)]
-        touchpad.send_events([*frame, *finger_state(len(positions)), InputEvent(EV_SYN.SYN_REPORT, 0)])
-        frame = []
+            fingers = {}
+        events = [e for s in sent - fingers.keys() for e in (InputEvent(EV_ABS.ABS_MT_SLOT, s),
+                                                             InputEvent(EV_ABS.ABS_MT_TRACKING_ID, -1))]
+        for s, (tracking_id, x, y) in fingers.items():
+            events += [InputEvent(EV_ABS.ABS_MT_SLOT, s), InputEvent(EV_ABS.ABS_MT_TRACKING_ID, tracking_id),
+                       InputEvent(EV_ABS.ABS_MT_POSITION_X, round(x)), InputEvent(EV_ABS.ABS_MT_POSITION_Y, round(y))]
+        if fingers:
+            events += [InputEvent(EV_ABS.ABS_X, round(first[0])), InputEvent(EV_ABS.ABS_Y, round(first[1]))]
+        touchpad.send_events([*events, *finger_state(len(fingers)), InputEvent(EV_SYN.SYN_REPORT, 0)])
+        sent = set(fingers)
 
 
 def forward_screen(tablet, config, height):
@@ -288,27 +306,28 @@ def exit_when_done(target, *args):
 
 def main():
     aspect, config = float(sys.argv[1]), json.loads(sys.argv[2])
-    flipped = config['flipped']
+    canvas = Canvas(config['layout'], config['flipped'], aspect)
     client = connect()
     install_bundle(client)
     image_w = config['image-width']
     image_h = round(image_w / aspect)
-    strip_h = DISPLAY_H - DISPLAY_W / aspect
-    pen_top = round(strip_h / DISPLAY_H * PEN_H)
+    setup = {'layout': config['layout'], 'portrait': canvas.portrait, 'flipped': canvas.flipped,
+             'pad': canvas.pad, 'inkDelay': config['ink-delay']}
 
     # Keeping stdin open keeps the frame up; it closes when this process exits.
     tablet_stdin, tablet_stdout, _ = client.exec_command(PC_MODE.format(
-        bin=TABLET_BIN, aspect=aspect, width=image_w, height=image_h, flipped=int(flipped)))
+        bin=TABLET_BIN, setup=shlex.quote(json.dumps(setup)), width=image_w, height=image_h, pen=PEN_COPY))
     tablet = Tablet(tablet_stdin)
 
     threading.Thread(target=forward_host, args=(tablet,), daemon=True).start()
     threading.Thread(target=exit_when_done, args=(forward_tablet, tablet_stdout), daemon=True).start()
-    if config['mirror']:
+    if config['mirror'] and canvas.pad[2]:
         threading.Thread(target=forward_screen, args=(tablet, config, image_h), daemon=True).start()
     if config['touchpad']:
         threading.Thread(target=exit_when_done, daemon=True, args=(
-            forward_touches, client, create_touchpad(), tablet, strip_h, config['palm-rejection'], flipped)).start()
-    exit_when_done(forward_pen, client, create_pen(), tablet, pen_top, flipped)
+            forward_touches, client, create_touchpad(canvas.w, canvas.h), tablet, canvas,
+            config['palm-rejection'])).start()
+    exit_when_done(forward_pen, client, create_pen(), tablet, canvas, config['ink'])
 
 
 if __name__ == '__main__':

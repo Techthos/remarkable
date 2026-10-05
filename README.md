@@ -13,7 +13,7 @@ Plug the tablet in over USB and switch PC mode on from the GNOME panel.
 
 xochitl is frozen during the session instead of stopped, so the tablet does not ask for the passcode again, and comes back exactly where you left it when you unplug or tap Close.
 
-Settings (mirror, cursor, image width, refresh rate, touchpad, palm rejection, orientation) are in the extension preferences.
+Settings (layout, mirror, cursor, image width, refresh rate, touchpad, palm rejection, ink, orientation) are in the extension preferences; screen sharing can also be switched off from the panel menu.
 
 ## Install
 

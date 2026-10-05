@@ -24,6 +24,7 @@ export default class RemarkablePcExtension extends Extension {
                 this._toggle.setToggleState(this._wanted());
                 this._sync();
             } else {
+                this._mirror.setToggleState(this._settings.get_boolean('mirror'));
                 this._restartBridge();
             }
         });
@@ -33,8 +34,11 @@ export default class RemarkablePcExtension extends Extension {
         this._toggle = new PopupMenu.PopupSwitchMenuItem('PC mode', this._wanted());
         this._toggle.connect('toggled', (_item, state) => this._settings.set_boolean('enabled', state));
         this._status = new PopupMenu.PopupMenuItem('', {reactive: false});
+        this._mirror = new PopupMenu.PopupSwitchMenuItem('Screen sharing', this._settings.get_boolean('mirror'));
+        this._mirror.connect('toggled', (_item, state) => this._settings.set_boolean('mirror', state));
         this._indicator.menu.addMenuItem(this._toggle);
         this._indicator.menu.addMenuItem(this._status);
+        this._indicator.menu.addMenuItem(this._mirror);
         this._indicator.menu.addAction('Settings', () => this.openPreferences());
         Main.panel.addToStatusArea(this.uuid, this._indicator);
 
@@ -58,6 +62,7 @@ export default class RemarkablePcExtension extends Extension {
         this._indicator = null;
         this._toggle = null;
         this._status = null;
+        this._mirror = null;
     }
 
     _wanted() {

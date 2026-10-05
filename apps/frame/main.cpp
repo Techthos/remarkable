@@ -5,15 +5,22 @@
 #include <QImageReader>
 #include <QJsonDocument>
 #include <QJsonObject>
+#include <QLibrary>
+#include <QLibraryInfo>
+#include <QPainter>
 #include <QQmlApplicationEngine>
 #include <QQmlContext>
 #include <QQuickImageProvider>
 #include <QQuickItem>
+#include <QQuickPaintedItem>
 #include <QQuickWindow>
 #include <QSocketNotifier>
 #include <QTimer>
 #include <QtEndian>
 #include <cstdio>
+#include <fcntl.h>
+#include <linux/input.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static bool usbConnected()
@@ -109,7 +116,80 @@ static void point(QQuickWindow *window, QQuickItem *canvas, const QJsonObject &m
     QCoreApplication::sendEvent(window, &event);
 }
 
-// Arguments: aspect, image width, image height, flipped (1 or 0), xochitl screen dump. Stdin carries framed
+// The e-paper plugin exports the item that sets the waveform for the screen region under it, but registers
+// no QML type for it. It is a QQuickItem with one int, the mode, so the app builds one through the plugin's
+// constructor and gives it the fast pen waveform, hidden until ink is shown.
+static QQuickItem *penWaveform(QQuickItem *area)
+{
+    QLibrary plugin(QLibraryInfo::path(QLibraryInfo::PluginsPath) + "/scenegraph/qsgepaper");
+    const auto construct = reinterpret_cast<void (*)(void *, QQuickItem *)>(
+        plugin.resolve("_ZN16EPScreenModeItemC1EP10QQuickItem"));
+    if (!construct)
+        return nullptr;
+    auto *item = static_cast<QQuickItem *>(::operator new(sizeof(QQuickItem) + sizeof(int)));
+    construct(item, area);
+    item->setSize(area->size());
+    item->setProperty("mode", "Pen");
+    item->setVisible(false);
+    return item;
+}
+
+class InkTile : public QQuickPaintedItem
+{
+public:
+    static constexpr int size = 64;
+
+    InkTile(QQuickItem *pad, QPoint cell) : QQuickPaintedItem(pad), image(size, size, QImage::Format_ARGB32_Premultiplied)
+    {
+        image.fill(Qt::transparent);
+        setPosition(cell * size);
+        setSize(image.size());
+    }
+
+    void paint(QPainter *painter) override { painter->drawImage(0, 0, image); }
+
+    QImage image;
+};
+
+// Ink on the pad, painted into tiles that are created where the pen draws. Only the touched tiles redraw,
+// so a stroke costs the same however much ink is already on screen.
+struct Ink
+{
+    QQuickItem *pad;
+    QHash<QPoint, InkTile *> tiles;
+
+    void line(QPointF from, QPointF to)
+    {
+        const QRect bounds = QRectF(from, to).normalized().adjusted(-2, -2, 2, 2).toAlignedRect();
+        for (int y = bounds.top() / InkTile::size; y <= bounds.bottom() / InkTile::size; ++y) {
+            for (int x = bounds.left() / InkTile::size; x <= bounds.right() / InkTile::size; ++x) {
+                InkTile *&tile = tiles[QPoint(x, y)];
+                if (!tile)
+                    tile = new InkTile(pad, QPoint(x, y));
+                QPainter painter(&tile->image);
+                painter.translate(-tile->position());
+                painter.setPen(QPen(Qt::black, 4, Qt::SolidLine, Qt::RoundCap));
+                painter.drawLine(from, to);
+                tile->update();
+            }
+        }
+    }
+
+    void clear()
+    {
+        qDeleteAll(tiles);
+        tiles.clear();
+    }
+};
+
+// Pen digitizer units to scene pixels: its X runs up the portrait screen, its Y to the right.
+static QPointF penToScene(const QPointF &pen, const QQuickWindow *window)
+{
+    return {pen.y() / 15725 * window->width(), (1 - pen.x() / 20966) * window->height()};
+}
+
+// Arguments: layout as JSON (see the bridge), image width, image height, xochitl screen dump, pen event FIFO
+// that evgrab copies the pen to while ink is on. Stdin carries framed
 // messages: a type byte ('I' raw GRAY8 image of that size, 'M' JSON), a little endian
 // uint32 length, the payload. Stdout carries JSON lines with the actions tapped in the menu.
 // The app quits when stdin closes or the USB cable is unplugged, after drawing the screen
@@ -158,7 +238,7 @@ int main(int argc, char *argv[])
     auto finish = [&] {
         stdinWatch.setEnabled(false);
         usbWatch.stop();
-        restore->image = xochitlScreen(app.arguments().value(5));
+        restore->image = xochitlScreen(app.arguments().value(4));
         if (restore->image.isNull()) {
             QCoreApplication::quit();
             return;
@@ -196,6 +276,60 @@ int main(int argc, char *argv[])
             screen->image = QImage(reinterpret_cast<const uchar *>(image.constData()), width, height, width,
                                    QImage::Format_Grayscale8).copy();
             window->setProperty("imageNo", ++imageNo);
+        }
+    });
+
+    // The ink is drawn from the pen events right here, without the round trip through the PC. It clears
+    // once the pen has been out of range for the ink delay; coming back into range stops the count.
+    Ink ink{window->findChild<QQuickItem *>("ink")};
+    QQuickItem *waveform = penWaveform(ink.pad);
+    QTimer inkClear;
+    inkClear.setSingleShot(true);
+    inkClear.setInterval(QJsonDocument::fromJson(app.arguments().value(1).toUtf8())["inkDelay"].toDouble() * 1000);
+    auto showInk = [&](bool shown) {
+        if (waveform)
+            waveform->setVisible(shown);
+        window->setProperty("inkShown", shown);
+    };
+    QObject::connect(&inkClear, &QTimer::timeout, [&] {
+        ink.clear();
+        showInk(false);
+    });
+
+    // The FIFO is opened for writing too, so it never reports end of file while evgrab has not opened it yet.
+    const QByteArray penCopy = app.arguments().value(5).toLocal8Bit();
+    mkfifo(penCopy, 0600);
+    QSocketNotifier penWatch(open(penCopy, O_RDWR | O_NONBLOCK), QSocketNotifier::Read);
+    QPointF pen, last;
+    bool touching = false, stroking = false;
+    QObject::connect(&penWatch, &QSocketNotifier::activated, [&] {
+        input_event events[64];
+        const ssize_t n = read(penWatch.socket(), events, sizeof events);
+        for (ssize_t i = 0; i < n / ssize_t(sizeof *events); ++i) {
+            const input_event &e = events[i];
+            if (e.type == EV_ABS && e.code == ABS_X) {
+                pen.setX(e.value);
+            } else if (e.type == EV_ABS && e.code == ABS_Y) {
+                pen.setY(e.value);
+            } else if (e.type == EV_KEY && e.code == BTN_TOUCH) {
+                touching = e.value;
+            } else if (e.type == EV_KEY && (e.code == BTN_TOOL_PEN || e.code == BTN_TOOL_RUBBER)) {
+                // Out of range is never touching, even if the copy of the lift was dropped.
+                touching = touching && e.value;
+                if (e.value)
+                    inkClear.stop();
+                else
+                    inkClear.start();
+            } else if (e.type == EV_SYN && e.code == SYN_REPORT) {
+                const QPointF point = ink.pad->mapFromScene(penToScene(pen, window));
+                const bool drawing = touching && ink.pad->contains(point);
+                if (drawing) {
+                    ink.line(stroking ? last : point, point);
+                    showInk(true);
+                }
+                stroking = drawing;
+                last = point;
+            }
         }
     });
 
