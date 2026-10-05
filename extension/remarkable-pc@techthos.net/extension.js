@@ -90,20 +90,50 @@ export default class RemarkablePcExtension extends Extension {
         const {width, height} = Main.layoutManager.primaryMonitor;
         const process = Gio.Subprocess.new(
             ['python3', `${this.path}/rmpc.py`, String(width / height), JSON.stringify(this._config())],
-            Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDOUT_PIPE);
+            Gio.SubprocessFlags.STDIN_PIPE | Gio.SubprocessFlags.STDOUT_PIPE | Gio.SubprocessFlags.STDERR_PIPE);
         this._process = process;
         this._outbox = [];
         this._writing = false;
+        this._error = null;
         this._readTablet(process, new Gio.DataInputStream({base_stream: process.get_stdout_pipe()}));
+        this._readErrors(process, new Gio.DataInputStream({base_stream: process.get_stderr_pipe()}));
         process.wait_async(this._cancellable, () => {
             if (this._process !== process)
                 return;
             this._endSession();
+            this._notifyError();
             if (this._plugged() && this._wanted())
                 this._scheduleRestart();
             else
                 this._sync();
         });
+    }
+
+    // Without this the bridge would only fail into the journal, while PC mode silently
+    // reconnects forever. The last line is the one that says why: a Python traceback ends
+    // with its exception, and the bridge's own give up messages are a single line.
+    _readErrors(process, stream) {
+        stream.read_line_async(GLib.PRIORITY_DEFAULT, this._cancellable, (_stream, result) => {
+            let line;
+            try {
+                [line] = stream.read_line_finish_utf8(result);
+            } catch {
+                return;
+            }
+            if (line === null || this._process !== process)
+                return;
+            if (line.trim() !== '')
+                this._error = line.trim();
+            this._readErrors(process, stream);
+        });
+    }
+
+    // Once per distinct failure, so a reconnect loop does not bury the screen in notifications.
+    _notifyError() {
+        if (!this._error || this._error === this._notified)
+            return;
+        this._notified = this._error;
+        Main.notifyError('reMarkable PC mode failed', this._error);
     }
 
     // The bridge reports "ready" once the tablet app runs, then relays the actions tapped on the tablet.
@@ -119,8 +149,10 @@ export default class RemarkablePcExtension extends Extension {
             if (line === null || this._process !== process)
                 return;
             const message = JSON.parse(line);
-            if (message.type === 'ready')
+            if (message.type === 'ready') {
+                this._notified = null;
                 this._menu = new TabletMenu(menuMessage => this._write(process, menuMessage));
+            }
             else if (message.type === 'close')
                 this._settings.set_boolean('enabled', false);
             else

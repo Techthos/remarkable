@@ -124,7 +124,14 @@ def create_touchpad():
 def connect():
     client = paramiko.SSHClient()
     client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
-    client.connect(TABLET, username='root', key_filename=str(SSH_KEY) if SSH_KEY.exists() else None, timeout=10)
+    # The ssh agent is skipped: the gnome-keyring one in the shell's environment offers every key in
+    # ~/.ssh and signs RSA with SHA-1, which dropbear rejects, and those failures make paramiko fall
+    # through to a passphrase protected key and give up instead of trying the key that would work.
+    try:
+        client.connect(TABLET, username='root', allow_agent=False, timeout=10,
+                       key_filename=str(SSH_KEY) if SSH_KEY.exists() else None)
+    except (paramiko.SSHException, OSError) as error:
+        sys.exit(f'ssh to {TABLET} failed: {error}. Put a key the tablet accepts in {SSH_KEY}.')
     return client
 
 
